@@ -69,7 +69,7 @@ jobs:
               assert not name.endswith(('.private.json', '.save.json', '.pyc'))
               assert len(text.encode('utf-8')) <= 500000
               entries.append({'path': name, 'type': 'blob', 'mode': '100644', 'content': text})
-          assert 'gridciv/engine.py' in files and 'tests/test_engine.py' in files
+          assert 'gridciv/engine.py' in files and 'tests/test_core.py' in files
           current = api('/git/ref/heads/main')['object']['sha']
           assert current == head, 'Main moved: refusing to overwrite concurrent changes'
           parent = api('/git/commits/' + head)
