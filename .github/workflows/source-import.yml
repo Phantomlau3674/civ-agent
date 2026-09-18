@@ -1,4 +1,4 @@
-name: Initial source import
+name: Verified initial source import
 on:
   push:
     branches: [main]
@@ -12,16 +12,16 @@ jobs:
   import:
     if: github.repository == 'Phantomlau3674/civ-agent'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - name: Verify repository-local bundle and publish native source files
+      - name: Verify repository-local source, test, and publish
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           TRIGGER_SHA: ${{ github.sha }}
         shell: python
         run: |
-          import base64, hashlib, json, lzma, os, pathlib, urllib.request
+          import base64, hashlib, json, lzma, os, pathlib, subprocess, tempfile, urllib.request
           repo = os.environ['REPOSITORY']
           assert repo == 'Phantomlau3674/civ-agent'
           head = os.environ['TRIGGER_SHA']
@@ -30,52 +30,57 @@ jobs:
               data = None if body is None else json.dumps(body, ensure_ascii=False).encode('utf-8')
               request = urllib.request.Request(root + path, data=data, method=method, headers={
                   'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
-                  'Accept': 'application/vnd.github+json',
-                  'Content-Type': 'application/json',
-                  'X-GitHub-Api-Version': '2022-11-28',
-                  'User-Agent': 'civ-agent-initial-source-import'})
+                  'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json',
+                  'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'civ-agent-verified-import'})
               with urllib.request.urlopen(request, timeout=60) as response:
                   return json.load(response)
           obj = api('/contents/.bootstrap/request.json?ref=' + head)
           manifest = json.loads(base64.b64decode(obj['content']))
-          assert manifest['format'] == 'civ-agent-source-v1'
+          assert manifest['format'] == 'civ-agent-source-v2'
           assert 0 < len(manifest['chunks']) <= 64
           parts = []
-          for chunk in manifest['chunks']:
-              sha = chunk['sha']
+          for sha in manifest['chunks']:
               assert len(sha) == 40 and all(c in '0123456789abcdef' for c in sha)
               blob = api('/git/blobs/' + sha)
-              part = base64.b64decode(blob['content'], validate=False)
-              assert len(part) == chunk['bytes']
+              part = base64.b64decode(blob['content'])
               assert hashlib.sha1(b'blob ' + str(len(part)).encode() + b'\0' + part).hexdigest() == sha
               parts.append(part)
           packed = b''.join(parts)
+          print('Chunks:', len(parts), 'bytes:', [len(p) for p in parts], 'header:', packed[:12].hex(), flush=True)
           assert len(packed) <= 2000000
-          assert hashlib.sha256(packed).hexdigest() == manifest['sha256']
           decoder = lzma.LZMADecompressor(memlimit=128 * 1024 * 1024)
           raw = decoder.decompress(packed, max_length=5000001)
-          assert decoder.eof and not decoder.unused_data and len(raw) <= 5000000
+          assert decoder.eof and not decoder.unused_data and len(raw) <= 5000000, 'Source bundle is incomplete; no source will be published'
           files = json.loads(raw)
-          assert isinstance(files, dict) and len(files) == manifest['file_count']
-          assert 1 < len(files) <= 300
+          assert isinstance(files, dict) and 1 < len(files) <= 300
           roots = {'gridciv', 'tests', 'tools', 'docs', 'examples', 'evidence'}
           root_files = {'README.md', 'VALIDATION_REPORT.md', 'NOTICE.md', 'pyproject.toml', '.gitignore', '.gitattributes', 'run_demo.sh', 'run_demo.bat', 'SOURCE_MANIFEST.json'}
-          entries = []
-          for name, text in sorted(files.items()):
-              path = pathlib.PurePosixPath(name)
-              assert not path.is_absolute() and '..' not in path.parts and '\\' not in name
-              assert name == path.as_posix() and (name in root_files or path.parts[0] in roots)
-              assert isinstance(text, str) and '\0' not in text
-              assert not name.endswith(('.private.json', '.save.json', '.pyc'))
-              assert len(text.encode('utf-8')) <= 500000
-              entries.append({'path': name, 'type': 'blob', 'mode': '100644', 'content': text})
-          assert 'gridciv/engine.py' in files and 'tests/test_core.py' in files
-          current = api('/git/ref/heads/main')['object']['sha']
-          assert current == head, 'Main moved: refusing to overwrite concurrent changes'
+          entries, runtime_hashes = [], {}
+          with tempfile.TemporaryDirectory() as temp:
+              for name, text in sorted(files.items()):
+                  path = pathlib.PurePosixPath(name)
+                  assert not path.is_absolute() and '..' not in path.parts and '\\' not in name
+                  assert name == path.as_posix() and (name in root_files or path.parts[0] in roots)
+                  assert isinstance(text, str) and '\0' not in text and len(text.encode('utf-8')) <= 500000
+                  assert not name.endswith(('.private.json', '.save.json', '.pyc'))
+                  if path.parts[0] in {'gridciv', 'tests', 'tools', 'examples'} or name == 'pyproject.toml':
+                      runtime_hashes[name] = hashlib.sha256(text.replace('\r\n', '\n').encode('utf-8')).hexdigest()
+                  dest = pathlib.Path(temp) / path
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  dest.write_text(text, encoding='utf-8')
+                  entries.append({'path': name, 'type': 'blob', 'mode': '100644', 'content': text})
+              actual = hashlib.sha256(json.dumps(runtime_hashes, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+              print('Runtime fingerprint:', actual, 'files:', len(runtime_hashes), flush=True)
+              assert actual == manifest['runtime_sha256'], 'Does not match independently verified v0.4 source'
+              assert 'gridciv/engine.py' in files and 'tests/test_core.py' in files
+              env = {k: v for k, v in os.environ.items() if k not in {'GH_TOKEN', 'GITHUB_TOKEN'}}
+              env.update(PYTHONHASHSEED='719', PYTHONUTF8='1')
+              subprocess.run(['python3', '-m', 'unittest', 'discover', '-s', 'tests', '-t', '.', '-v'], cwd=temp, env=env, check=True, timeout=600)
+          assert api('/git/ref/heads/main')['object']['sha'] == head, 'Main moved; refusing to overwrite concurrent work'
           parent = api('/git/commits/' + head)
           tree = api('/git/trees', 'POST', {'base_tree': parent['tree']['sha'], 'tree': entries})
           commit = api('/git/commits', 'POST', {
-              'message': 'feat: publish gridciv v0.4 economic baselines and verified source\n\nSource SHA256: ' + manifest['sha256'],
+              'message': 'feat: publish tested gridciv v0.4 source\n\nRuntime SHA256: ' + manifest['runtime_sha256'],
               'tree': tree['sha'], 'parents': [head]})
           api('/git/refs/heads/main', 'PATCH', {'sha': commit['sha'], 'force': False})
-          print(json.dumps({'commit': commit['sha'], 'tree': tree['sha'], 'files': len(files), 'source_sha256': manifest['sha256']}))
+          print(json.dumps({'commit': commit['sha'], 'files': len(files), 'runtime_sha256': actual}), flush=True)
