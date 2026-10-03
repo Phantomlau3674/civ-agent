@@ -1,0 +1,38 @@
+name: Engine tests
+on:
+  push:
+    branches: [main, 'release/**']
+    paths: ['gridciv/**', 'tests/**', 'tools/**', 'launch.py', 'watch.py', 'WATCH_*', 'PLAY.*', 'pyproject.toml', '.github/workflows/ci.yml']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch the exact public repository commit
+        env:
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git init .
+          git remote add origin "https://github.com/${SOURCE_REPOSITORY}.git"
+          git fetch --depth 1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Runtime and full regression suite
+        run: |
+          python3 --version
+          python3 -m unittest discover -s tests -t . -v
+      - name: Headless startup and replay
+        run: python3 -m gridciv demo --players 2 --small --rounds 20 --output runs/ci --verify-replay
+      - name: Verify offline launcher and current source gates
+        run: |
+          printf '4\n' | python3 launch.py
+          python3 tools/audit_effects.py
+      - name: Autonomous host and durable action recovery
+        run: python3 tools/watch_smoke.py --output runs/ci-watch.json
