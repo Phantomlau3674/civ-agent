@@ -1,0 +1,80 @@
+name: Read back legacy staging
+on:
+  push:
+    branches: ['sync/v0.9.0-alpha']
+    paths: ['.github/workflows/readback-staging.yml']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Recover complete text entries for local byte comparison only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, lzma, os, pathlib, urllib.request
+          root = 'https://api.github.com/repos/Phantomlau3674/civ-agent'
+          def get(path):
+              req = urllib.request.Request(root + path, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json',
+                  'User-Agent': 'civ-agent-staging-readback'})
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.load(response)
+          old = get('/contents/.bootstrap/request.json?ref=78fda9a51ec3e173af78b4f24ff4ffb622a075df')
+          manifest = json.loads(base64.b64decode(old['content']))
+          assert len(manifest['chunks']) <= 64
+          parts = []
+          for sha in manifest['chunks']:
+              assert len(sha) == 40 and all(c in '0123456789abcdef' for c in sha)
+              obj = get('/git/blobs/' + sha)
+              data = base64.b64decode(obj['content'])
+              assert hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest() == sha
+              parts.append(data)
+          packed = b''.join(parts)
+          assert len(packed) < 2000000
+          pathlib.Path('readback').mkdir()
+          pathlib.Path('readback/packed.xz').write_bytes(packed)
+          decoder = lzma.LZMADecompressor(memlimit=128*1024*1024)
+          outputs = []
+          for offset in range(0, len(packed), 32):
+              try:
+                  outputs.append(decoder.decompress(packed[offset:offset+32]))
+              except lzma.LZMAError:
+                  break
+          prefix = b''.join(outputs).decode('utf-8', errors='ignore')
+          assert len(prefix) < 10000000
+          parser = json.JSONDecoder()
+          cursor = prefix.index('{') + 1
+          recovered = {}
+          while cursor < len(prefix):
+              while cursor < len(prefix) and prefix[cursor] in ' \r\n\t,':
+                  cursor += 1
+              try:
+                  key, cursor = parser.raw_decode(prefix, cursor)
+                  while prefix[cursor].isspace():
+                      cursor += 1
+                  assert prefix[cursor] == ':'
+                  cursor += 1
+                  while prefix[cursor].isspace():
+                      cursor += 1
+                  value, cursor = parser.raw_decode(prefix, cursor)
+              except (ValueError, IndexError, AssertionError):
+                  break
+              assert isinstance(key, str) and isinstance(value, str)
+              assert key not in recovered
+              recovered[key] = value
+          pathlib.Path('readback/recovered.json').write_text(json.dumps(recovered, ensure_ascii=False, sort_keys=True), encoding='utf-8')
+          inventory = {key: hashlib.sha256(value.encode()).hexdigest() for key, value in recovered.items()}
+          pathlib.Path('readback/inventory.json').write_text(json.dumps(inventory, sort_keys=True, indent=2), encoding='utf-8')
+          print(json.dumps({'complete_entries': len(recovered), 'prefix_bytes': len(prefix.encode()), 'compressed_bytes': len(packed)}))
+      - name: Return readback for exact comparison
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: legacy-staging-readback
+          path: readback/
+          retention-days: 1
+          if-no-files-found: error
